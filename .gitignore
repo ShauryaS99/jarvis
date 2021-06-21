@@ -1,0 +1,6 @@
+Jarvis_Job.bat
+__pycache__/
+jarvis-creds.json
+jarvis_client.json
+oauth_client.json
+token.json
