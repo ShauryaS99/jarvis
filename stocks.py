@@ -234,9 +234,6 @@ class Profits:
     def from_dict(source):
         return Profits(source['ticker'], source['shares_sold'], source['price_bought'], source['price_sold'], source['date_sold'])
 
-
-# totp  = pyotp.TOTP("TW77P2ZDFTX5LDXL").now()
-# login = rh.login('shaurya.sanghvi@gmail.com','RNaryan#99', mfa_code=totp)
 # lst = rh.account.get_open_stock_positions(info=None)
 
 # g = requests.get(response['instrument'])
