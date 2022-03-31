@@ -162,7 +162,6 @@ b) selling should invovle profits table
 
 2) prev_close should update on a cronjob
 
-
 """
 
 #for profits: you can have partial sells 
