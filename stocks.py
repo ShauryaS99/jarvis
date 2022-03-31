@@ -160,7 +160,7 @@ a) these updates should be parsed from robinhood/ plaid: extract trade with shar
 b) selling should invovle profits table
 
 
-2) prev_close should update on a cronjob
+2) prev_close should update on cronjob
 
 """
 
