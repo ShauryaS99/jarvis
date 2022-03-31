@@ -161,6 +161,7 @@ b) selling should invovle profits table
 
 
 2) prev_close should update on cronjob
+3) check config.py for github token!
 
 """
 
