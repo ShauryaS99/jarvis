@@ -25,6 +25,13 @@ from datetime import datetime
 from datetime import date
 from datetime import timedelta
 import re
+import logging
+
+logging.basicConfig(filename='robinhood.log',
+                            filemode='a',
+                            format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+                            datefmt='%d-%b-%y %H:%M',
+                            level=logging.DEBUG)
 
 # {
 #     'url': 'https://api.robinhood.com/positions/458876026/c755d776-0378-4d84-b6c8-d9f54306048e/',
@@ -122,14 +129,19 @@ class Trades:
     # api call to get previous close for ticker
     def update_stock_close(self):
         close_price = rh.stocks.get_latest_price(self.ticker)
-        self.stock_close = float(close_price[0])
+        if close_price[0]:
+            self.stock_close = float(close_price[0])
+        else:
+            self.stock_close = None
+            logging.info("Ticker no longer active: " + self.ticker)
 
     # calculate percentage diff  #2) should mess with keeping method static, and trying to use self
     # @staticmethod  
     def update_percent_gain(self):    
         prev_price = self.avg_price
         curr_price = self.stock_close
-        self.percent_gain = round((curr_price - prev_price) / prev_price * 100, 2)
+        if curr_price:
+            self.percent_gain = round((curr_price - prev_price) / prev_price * 100, 2)
 
     # calculate curr profit
     # @staticmethod  
@@ -137,14 +149,16 @@ class Trades:
         num_shares = self.shares
         prev_price = self.avg_price
         curr_price = self.stock_close
-        self.value_gain = round((curr_price - prev_price) * num_shares, 2)
+        if curr_price:
+            self.value_gain = round((curr_price - prev_price) * num_shares, 2)
 
     def to_json(self):
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=False, indent=4)
 
     @staticmethod
     def from_dict(source):
-        return Trades(source['ticker'], source['shares'], source['avg_price'], source['date_bought'], source['date_updated'])
+        return Trades(source['ticker'], source['shares'], source['avg_price'], source['date_bought'], 
+            source['date_updated'], source['category'])
 
 #check links:
 # https://stackoverflow.com/questions/3768895/how-to-make-a-class-json-serializable
@@ -211,6 +225,9 @@ class Profits:
     def get_shares_sold(self):    
         return self.shares_sold
 
+    def set_avg_buy_price(self, avg_buy_price):    
+        self.avg_buy_price = avg_buy_price
+
     def get_avg_buy_price(self):    
         return self.avg_buy_price
 
@@ -228,11 +245,16 @@ class Profits:
         self.profit = (self.avg_sell_price - self.avg_buy_price) * self.shares_sold
 
     def update_profit_percentage(self):
-        self.profit_percentage = round((self.avg_sell_price - self.avg_buy_price) / self.avg_buy_price * 100, 2)
+        if self.avg_buy_price:
+            self.profit_percentage = round((self.avg_sell_price - self.avg_buy_price) / self.avg_buy_price * 100, 2)
+        else:
+            self.profit_percentage = round((self.avg_sell_price - self.avg_buy_price) / 1 * 100, 2)
+            logging.info("Free stock sold: " + self.ticker)
 
     @staticmethod
     def from_dict(source):
-        return Profits(source['ticker'], source['shares_sold'], source['price_bought'], source['price_sold'], source['date_sold'])
+        return Profits(source['ticker'], source['date_bought'], source['date_sold'], source['shares_sold'], source['avg_buy_price'],
+            source['avg_sell_price'], source['position_open'], source['category'])
 
 # lst = rh.account.get_open_stock_positions(info=None)
 
@@ -247,13 +269,6 @@ class Profits:
 # print(j)
 # print(j[0])
 # print(float(j[0]))
-# list_stock_positions = rh.account.get_open_stock_positions(info=None)
-# list_tickers = []
-# for pos in list_stock_positions:
-#    resp = requests.get(pos['instrument'])
-#    ticker = json.loads(resp.text)['symbol']
-#    list_tickers.append(ticker)
-# print(list_tickers)
 # #403830
 # # OTP 166772 941932
 
@@ -324,10 +339,17 @@ json_path = home_dir + "OneDrive/scratch/jarvis/firestore_key.json"
 cred = credentials.Certificate(json_path)
 firebase_admin.initialize_app(cred)
 
+# list_open_positions = rh.account.get_open_stock_positions()
+# print(len(list_open_positions))
+# for pos in list_open_positions:
+#     resp = requests.get(pos['instrument'])
+#     ticker = json.loads(resp.text)['symbol']
+#     print(ticker)
+#     print(pos)
 
 #SANDBOX
-print("Starting process")
-update_open_positions()
+# print("Starting process")
+# update_open_positions()
 
 
 
@@ -362,17 +384,153 @@ update_open_positions()
 # print("finished")
 
 #one time run for setup
+#handles buys & sells MASTER MEGACLASS method
 def initialize_all_profit():
+    logging.info("Running Initialize_Profits ..")
     db = firestore.client()
-    list_stock_positions = rh.account.get_open_stock_positions(info=None)
-    counter = 0
-    for pos in list_stock_positions:
-       resp = requests.get(pos['instrument'])
-       ticker = json.loads(resp.text)['symbol']
-       help_create_trade(ticker)
-       print("Added: " + ticker)
-       counter += 1
-    print(str(counter) + " positions added")
+    list_stock_positions = rh.orders.get_all_stock_orders(info=None)
+    buy_counter = 0
+    sell_counter = 0
+    for rh_pos in reversed(list_stock_positions):
+        resp = requests.get(rh_pos['instrument'])
+        ticker = json.loads(resp.text)['symbol']
+        if rh_pos['state'] != 'filled':
+            logging.info(("Skipping %s w/ id: %s" %(ticker, rh_pos['id'])))
+            continue
+        if rh_pos['side'] == 'buy':
+            #check if ticker exists in firestore
+            doc_ref = db.collection(u'temp_trades').document(ticker)
+            doc = doc_ref.get()
+            if doc.exists:
+                #update buy for a ticker
+                fs_trade = Trades.from_dict(doc.to_dict())
+                date_updated = rh_pos['updated_at']
+                fs_trade.set_date_updated(date_updated)
+                #add bought shares to total
+                new_shares = round(float(rh_pos['cumulative_quantity']), 2)
+                old_shares = fs_trade.get_shares()
+                num_shares = new_shares + old_shares
+                #calculate new avg buy price
+                new_avg_price = round(float(rh_pos['average_price']), 2)
+                old_avg_price = fs_trade.get_avg_price()
+                new_total_buy_price = new_avg_price * new_shares
+                old_total_buy_price = old_avg_price * old_shares
+                avg_buy_price = (new_total_buy_price + old_total_buy_price) / (num_shares)
+
+                fs_trade.set_shares(num_shares)
+                fs_trade.set_avg_price(avg_buy_price)
+                #just calculates position based on shares * price
+                fs_trade.update_position()
+                buy_counter += 1
+                print(u'Updated temp trade position: ' + ticker)
+                logging.info("Updating buy for %s - shares: %s, avg_price: %s" 
+                    %(ticker, str(new_shares), str(new_avg_price)))
+                doc_ref.update(fs_trade.__dict__)
+            else:
+                #first buy for a ticker
+                num_shares = round(float(rh_pos['cumulative_quantity']), 2)
+                avg_buy_price = round(float(rh_pos['average_price']), 2)
+                date_bought = rh_pos['created_at']
+                date_updated = rh_pos['updated_at']
+                #Get category from trade collection
+                doc_trade_ref = db.collection(u'trades').document(ticker)
+                doc_trade = doc_trade_ref.get()
+                category = None
+                #redundant check
+                if doc_trade.exists:
+                    open_position_fs = Trades.from_dict(doc_trade.to_dict())
+                    category = open_position_fs.get_category()
+                fs_trade = Trades(ticker, num_shares, avg_buy_price, date_bought, date_updated, category)
+                db.collection(u'temp_trades').document(ticker).set(fs_trade.__dict__)
+                buy_counter += 1
+                print(u'New temp trade position: ' + ticker)
+                logging.info("New buy for %s - shares: %s, avg_price: %s" 
+                    %(ticker, str(num_shares), str(avg_buy_price)))
+        if rh_pos['side'] == 'sell':
+            #check if ticker exists in firestore
+            doc_ref = db.collection(u'profits').document(ticker)
+            doc = doc_ref.get()
+            if doc.exists:
+                #update profit for a ticker
+                fs_profit = Profits.from_dict(doc.to_dict())
+                date_sold = rh_pos['updated_at']
+                fs_profit.set_date_sold(date_sold)
+                #add sold shares to total
+                new_shares_sold = round(float(rh_pos['cumulative_quantity']), 2)
+                old_shares_sold = fs_profit.get_shares_sold()
+                total_shares_sold = new_shares_sold + old_shares_sold
+                #calculate new avg sell price
+                new_avg_price = round(float(rh_pos['average_price']), 2)
+                old_avg_price = fs_profit.get_avg_sell_price()
+                new_total_sell_price = new_avg_price * new_shares_sold
+                old_total_sell_price = old_avg_price * old_shares_sold
+                avg_sell_price = (new_total_sell_price + old_total_sell_price) / (total_shares_sold)
+                fs_profit.set_shares_sold(total_shares_sold)
+                fs_profit.set_avg_sell_price(avg_sell_price)
+
+                #get avg_buy price from trades collection & update num_shares_held
+                doc_trade_ref = db.collection(u'temp_trades').document(ticker)
+                doc_trade = doc_trade_ref.get()
+                if doc_trade.exists:
+                    open_position_fs = Trades.from_dict(doc_trade.to_dict())
+                    avg_buy_price = open_position_fs.get_avg_price()
+                    fs_profit.set_avg_buy_price(avg_buy_price)
+                    #update trade positions with less num_shares
+                    open_position_fs.set_date_updated(date_sold)
+                    num_shares = open_position_fs.get_shares()
+                    remaining_shares = num_shares - new_shares_sold
+                    open_position_fs.set_shares(remaining_shares)
+                    open_position_fs.update_position()
+                    print(u'Updated temp trade position: ' + ticker)
+                    doc_trade_ref.update(open_position_fs.__dict__)
+
+                #update stock price
+                fs_profit.update_profit()
+                fs_profit.update_profit_percentage()
+                doc_ref.update(fs_profit.__dict__)
+                sell_counter += 1
+                print(u'Updated profit position: ' + ticker)
+                logging.info("Update: sold %s - shares: %s, avg_price: %s" 
+                    %(ticker, str(new_shares_sold), str(new_avg_price)))
+            else:
+                #create new profit
+                shares_sold = round(float(rh_pos['cumulative_quantity']), 2)
+                avg_sell_price = round(float(rh_pos['average_price']), 2)
+                date_sold = rh_pos['updated_at']
+
+                #get avg_buy price from trades collection & update num_shares_held
+                doc_trade_ref = db.collection(u'temp_trades').document(ticker)
+                doc_trade = doc_trade_ref.get()
+                avg_buy_price = 0
+                date_bought = None
+                position_open = True
+                category = None
+                if doc_trade.exists:
+                    open_position_fs = Trades.from_dict(doc_trade.to_dict())
+                    avg_buy_price = open_position_fs.get_avg_price()
+                    date_bought = open_position_fs.get_date_bought()
+                    category = open_position_fs.get_category()
+                    position_open = True
+                    #update trade positions with less num_shares
+                    open_position_fs.set_date_updated(date_sold)
+                    num_shares = open_position_fs.get_shares()
+                    remaining_shares = num_shares - shares_sold
+                    open_position_fs.set_shares(remaining_shares)
+                    open_position_fs.update_position()
+                    print(u'Updated temp trade position: ' + ticker)
+                    doc_trade_ref.update(open_position_fs.__dict__)
+
+                fs_profit = Profits(ticker, date_bought, date_sold, shares_sold, avg_buy_price, avg_sell_price, position_open, category)
+                db.collection(u'profits').document(ticker).set(fs_profit.__dict__)
+                sell_counter += 1
+                print(u'New profit position: ' + ticker)
+                logging.info("New: sold %s - shares: %s, avg_price: %s" 
+                    %(ticker, str(shares_sold), str(avg_sell_price)))
+    print(str(buy_counter) + " buys")
+    logging.info("Number of buys: %s" %(str(buy_counter)))
+    print(str(sell_counter) + " sells")
+    logging.info("Number of sells: %s" %(str(sell_counter)))
+
 
 
 # #Weekly Run
@@ -396,7 +554,7 @@ def update_profits():
             continue
 
         #Processing
-        resp = requests.get(pos['instrument'])
+        resp = requests.get(rh_pos['instrument'])
         ticker = json.loads(resp.text)['symbol']
         #check if ticker exists in firestore
         doc_ref = db.collection(u'profits').document(ticker)
@@ -434,7 +592,7 @@ def update_profits():
 
                 counter += 1
                 print(u'Updated profit position: ' + ticker)
-            #update stock price
+            #update profit
             fs_profit.update_profit()
             fs_profit.update_profit_percentage()
             doc_ref.update(fs_profit.__dict__)
@@ -446,17 +604,17 @@ def update_profits():
             # date_updated = rh_pos['updated_at']
             doc_trade_ref = db.collection(u'trades').document(ticker)
             doc_trade = doc_trade_ref.get()
-            avg_buy_price = None
+            avg_buy_price = 0
             date_bought = None
             position_open = True
             category = None
-                #redundant check
-                if doc_trade.exists:
-                    open_position_fs = Trades.from_dict(doc_trade.to_dict())
-                    avg_buy_price = open_position_fs.get_avg_price()
-                    date_bought = open_position_fs.get_date_bought()
-                    category = open_position_fs.get_category()
-                    position_open = True
+            #redundant check
+            if doc_trade.exists:
+                open_position_fs = Trades.from_dict(doc_trade.to_dict())
+                avg_buy_price = open_position_fs.get_avg_price()
+                date_bought = open_position_fs.get_date_bought()
+                category = open_position_fs.get_category()
+                position_open = True
             fs_profit = Profits(ticker, date_bought, date_sold, shares_sold, avg_buy_price, avg_sell_price, position_open, category=None)
             db.collection(u'profits').document(ticker).set(fs_profit.__dict__)
             counter += 1
@@ -490,3 +648,7 @@ def update_profits():
 
 # 2. maintenance 
 # can use get_all_positions(b'AAPL') method with info set to ticker in question
+
+logging.info("Initiating Profit MegaRun ..")
+initialize_all_profit()
+logging.info("Finished Profit MegaRun")
